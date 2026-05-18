@@ -25,13 +25,11 @@ if __name__ == "__main__":
     parser.add_argument("--ws", default="ws://localhost:8000", help="URL du backend FastAPI")
     parser.add_argument("--serial", default=None, help="Numéro de série ADB (optionnel)")
     parser.add_argument("--frida-server", default=None, help="Chemin local vers frida-server")
-    parser.add_argument("--skip-install", action="store_true", help="Sauter l'installation si l'APK est déjà présent")
+    parser.add_argument("--skip-install", action="store_true", help="Ne pas réinstaller l'APK (recommandé — évite de fermer DIVA)")
     args = parser.parse_args()
 
     log.info(f"Démarrage de l'analyse pour la session: {args.session}")
 
-    # Initialisation de l'analyseur
-    # C'est ici que le code d'envoi (websocket.send_json) doit être implémenté
     analyzer = DynamicAnalyzer(
         apk_path=args.apk,
         session_id=args.session,

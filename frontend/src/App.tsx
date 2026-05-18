@@ -1,5 +1,5 @@
 // frontend/src/App.tsx
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell
 } from "recharts";
@@ -56,6 +56,7 @@ const TYPE_META: Record<string, { color: string; bg: string; border: string; lab
   anti_analysis:{ color:"#ef4444", bg:"#fff1f2", border:"#fecdd3", label:"Anti-analyse", icon:"⬟" },
   alert:        { color:"#ef4444", bg:"#fff1f2", border:"#fecdd3", label:"Alerte",       icon:"▲" },
   hook_error:   { color:"#64748b", bg:"#f8fafc", border:"#e2e8f0", label:"Hook error",   icon:"◇" },
+  system:       { color:"#6366f1", bg:"#eef2ff", border:"#c7d2fe", label:"Système",      icon:"◉" },
 };
 
 const SEV_COLOR: Record<string, string> = {
@@ -73,62 +74,95 @@ const RISK_COLOR = (score: number) =>
 // HOOK WEBSOCKET
 // ══════════════════════════════════════════════════════════════════════════════
 
-function useAnalysisWS(sessionId: string | null, enabled: boolean = false) {
+const WS_BASE = import.meta.env.VITE_WS_URL ?? "ws://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+
+function applyWSMessage(
+  data: Record<string, unknown>,
+  setEvents: Dispatch<SetStateAction<AnalysisEvent[]>>,
+  setStats: Dispatch<SetStateAction<Stats>>,
+  setRisk: Dispatch<SetStateAction<RiskReport>>,
+  setStatic: Dispatch<SetStateAction<StaticReport | null>>,
+) {
+  if (data.kind === "snapshot" && data.payload && typeof data.payload === "object") {
+    const p = data.payload as Record<string, unknown>;
+    if (p.static_analysis) setStatic(p.static_analysis as StaticReport);
+    if (p.stats) setStats(p.stats as Stats);
+    if (p.risk) setRisk(p.risk as RiskReport);
+    if (Array.isArray(p.events) && p.events.length > 0) {
+      setEvents([...(p.events as AnalysisEvent[])].reverse());
+    }
+    return;
+  }
+
+  if (data.kind === "message" && data.payload && typeof data.payload === "object") {
+    const p = data.payload as Record<string, unknown>;
+    if (p.event) setEvents(prev => [p.event as AnalysisEvent, ...prev].slice(0, 500));
+    if (p.stats) setStats(p.stats as Stats);
+    if (p.risk) setRisk(p.risk as RiskReport);
+    if (p.static_analysis) setStatic(p.static_analysis as StaticReport);
+    return;
+  }
+
+  if (data.kind === "status" && data.payload && typeof data.payload === "object") {
+    // géré côté Dashboard via setAnalyzing — noop ici, réservé pour extension
+  }
+}
+
+function useAnalysisWS(
+  sessionId: string | null,
+  onStatus?: (status: string) => void,
+) {
   const [events, setEvents]       = useState<AnalysisEvent[]>([]);
   const [stats, setStats]         = useState<Stats>({ network:0,file:0,crypto:0,sql:0,permission:0,ipc:0,sensor:0,alert:0,total:0,duration_seconds:0 });
   const [risk, setRisk]           = useState<RiskReport>({ global_score:0, level:"low", dimensions:{}, alerts_count:{critical:0,high:0,medium:0} });
   const [staticReport, setStatic] = useState<StaticReport | null>(null);
   const [connected, setConnected] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
-    if (!sessionId || !enabled) return;
-    let dead = false;
+    if (!sessionId) return;
+    let stopped = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = () => {
-      const ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`);
-      wsRef.current = ws;
+      if (stopped) return;
+      const url = `${WS_BASE}/ws/${encodeURIComponent(sessionId)}?role=dashboard`;
+      socket = new WebSocket(url);
 
-      ws.onopen  = () => { if (!dead) setConnected(true); };
-      ws.onclose = () => {
+      socket.onopen = () => { if (!stopped) setConnected(true); };
+      socket.onclose = () => {
         setConnected(false);
-        if (!dead) setTimeout(connect, 3000);
+        socket = null;
+        if (!stopped) reconnectTimer = setTimeout(connect, 3000);
       };
-      ws.onerror = () => {};
-
-      ws.onmessage = (msg) => {
-        let data;
-        try { data = JSON.parse(msg.data); } catch(_) { return; }
-        if (!data) return;
-
-        if (data.kind === "message" && data.payload) {
-          const p = data.payload;
-          if (p.event) setEvents(prev => [p.event, ...prev].slice(0, 500));
-          if (p.stats) setStats(p.stats);
-          if (p.risk)  setRisk(p.risk);
-          return;
-        }
-
-        if (data.kind === "snapshot" && data.payload) {
-          const p = data.payload;
-          if (p.static_analysis) setStatic(p.static_analysis);
-          return;
-        }
-
-
-        if (data.type === "event") {
-          if (data.event) setEvents(prev => [data.event, ...prev].slice(0, 500));
-          if (data.stats) setStats(data.stats);
-          if (data.risk)  setRisk(data.risk);
-        } else if (data.type === "static_report") {
-          setStatic(data.data);
-        }
+      socket.onmessage = (msg) => {
+        try {
+          const data = JSON.parse(msg.data);
+          if (data && typeof data === "object") {
+            if (data.kind === "status" && data.payload?.status) {
+              onStatus?.(data.payload.status as string);
+            }
+            applyWSMessage(data, setEvents, setStats, setRisk, setStatic);
+          }
+        } catch { /* ignore malformed frames */ }
       };
-};
+    };
 
-    connect();
-    return () => { dead = true; wsRef.current?.close(); };
-  }, [sessionId, enabled]);
+    // Différé : évite "closed before connection" avec React StrictMode (double mount)
+    const startTimer = setTimeout(connect, 0);
+
+    return () => {
+      stopped = true;
+      clearTimeout(startTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (socket) {
+        socket.onclose = null;
+        socket.close();
+      }
+      setConnected(false);
+    };
+  }, [sessionId, onStatus]);
 
   return { events, stats, risk, staticReport, connected };
 }
@@ -238,6 +272,9 @@ function EventItem({ event }: { event: AnalysisEvent }) {
   const time = new Date(event.timestamp).toLocaleTimeString("fr-FR");
   const detail = event.data?.url || event.data?.path || event.data?.query ||
     event.data?.algorithm || event.data?.operation || event.data?.message ||
+    event.data?.tag ||
+    (event.data?.key ? `key=${event.data.key}` : null) ||
+    event.data?.activity ||
     JSON.stringify(event.data).slice(0, 80);
   return (
     <div style={{
@@ -332,7 +369,7 @@ function UploadPage({ onSession }: { onSession: (id: string) => void }) {
 
     try {
       setProgress(40);
-      const res = await fetch("http://localhost:8000/api/apk/upload", {
+      const res = await fetch(`${API_BASE}/api/apk/upload`, {
         method: "POST", body: form
       });
       setProgress(80);
@@ -425,7 +462,11 @@ function Dashboard({ sessionId, onReset }: { sessionId: string; onReset: () => v
   const [analyzing, setAnalyzing] = useState(false);
   const [activeTab, setActiveTab] = useState<"dynamic"|"static">("dynamic");
   const [filterType, setFilterType] = useState<string | null>(null);
-  const { events, stats, risk, staticReport, connected } = useAnalysisWS(sessionId, analyzing);
+  const handleWSStatus = useCallback((status: string) => {
+    if (status === "analyzing") setAnalyzing(true);
+    if (status === "stopped" || status === "failed") setAnalyzing(false);
+  }, []);
+  const { events, stats, risk, staticReport, connected } = useAnalysisWS(sessionId, handleWSStatus);
 
   // Timeline barres (60 dernières secondes)
   const [timeline, setTimeline] = useState<Array<{ t:number; n:number; color:string }>>([]);
@@ -435,13 +476,44 @@ function Dashboard({ sessionId, onReset }: { sessionId: string; onReset: () => v
     setTimeline(prev => [...prev.slice(-59), { t: Date.now(), n: 1, color }]);
   }, [events.length]);
 
+  const [analysisError, setAnalysisError] = useState("");
+
   const startAnalysis = async () => {
-    setAnalyzing(true);
+    setAnalysisError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/analysis/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        let detail = errText;
+        try { detail = JSON.parse(errText).detail ?? errText; } catch { /* raw */ }
+        throw new Error(typeof detail === "string" ? detail : errText);
+      }
+      setAnalyzing(true);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Impossible de démarrer l'analyse";
+      setAnalysisError(msg);
+      setAnalyzing(false);
+    }
   };
-   
 
   const stopAnalysis = async () => {
-    setAnalyzing(false);
+    setAnalysisError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/analysis/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+    } catch (e: unknown) {
+      setAnalysisError(e instanceof Error ? e.message : "Impossible d'arrêter l'analyse");
+    } finally {
+      setAnalyzing(false);
+    }
   };
 
   const manifest = staticReport?.manifest;
@@ -506,9 +578,16 @@ function Dashboard({ sessionId, onReset }: { sessionId: string; onReset: () => v
             </div>
           )}
 
+          {analysisError && (
+            <span style={{ fontSize: 12, color: "#ef4444", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>
+              {analysisError}
+            </span>
+          )}
+
           {/* Boutons */}
           {!analyzing ? (
-            <button onClick={startAnalysis} style={{
+            <button onClick={startAnalysis} title="Lance DIVA sur l'émulateur si besoin, puis injecte Frida (un seul clic)"
+              style={{
               background:"#6366f1", color:"#fff", border:"none",
               borderRadius:8, padding:"7px 16px", cursor:"pointer", fontWeight:600, fontSize:13
             }}>
@@ -596,7 +675,9 @@ function Dashboard({ sessionId, onReset }: { sessionId: string; onReset: () => v
                   ))}
                   {filteredEvents.length === 0 && (
                     <div style={{ textAlign:"center", color:"#9ca3af", padding:"40px 0", fontSize:13 }}>
-                      {analyzing ? "En attente d'événements…" : "Démarrer l'analyse pour voir les événements"}
+                      {analyzing
+                        ? "DIVA doit être visible sur l'émulateur — testez chaque exercice (SAVE, etc.)"
+                        : "Cliquez « Démarrer l'analyse » pour lancer DIVA et capturer les événements"}
                     </div>
                   )}
                 </div>

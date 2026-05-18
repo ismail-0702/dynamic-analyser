@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+log = logging.getLogger(__name__)
 
 from backend.services.event_broadcaster import broadcaster
 from backend.services.session_manager import session_manager
@@ -39,11 +42,18 @@ async def _handle_analyzer(websocket: WebSocket, session_id: str) -> None:
                 message = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if session_manager.get_session(session_id) is not None:
-                session_manager.update_session_stats(session_id, message)
+            runtime = session_manager.sessions.get(session_id)
+            if runtime is not None:
+                try:
+                    session_manager.update_session_stats(session_id, message)
+                except Exception as exc:
+                    log.warning("Événement ignoré (session %s): %s", session_id, exc)
+            else:
+                log.warning(
+                    "Session %s inconnue côté backend — événements relayés quand même au dashboard",
+                    session_id,
+                )
             await broadcaster.broadcast(session_id, {"kind": "message", "payload": message})
     except WebSocketDisconnect:
-        session = session_manager.get_session(session_id)
-        if session and session.status == "analyzing":
-            session.status = "failed"
-        await broadcaster.broadcast(session_id, {"kind": "status", "payload": {"status": "disconnected"}})
+        session_manager.mark_failed(session_id)
+        await broadcaster.broadcast(session_id, {"kind": "status", "payload": {"status": "failed"}})

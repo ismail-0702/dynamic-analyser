@@ -66,6 +66,55 @@ class ADBManager:
             raise RuntimeError("Could not extract package name from APK")
         return package_name
 
+    def get_running_pid(self, package_name: str) -> int | None:
+        """Retourne le PID du processus Android s'il tourne (via adb pidof)."""
+        result = self._run("shell", "pidof", package_name, check=False)
+        out = (result.stdout or "").strip()
+        if not out:
+            # Fallback : ps | grep package
+            result = self._run("shell", "ps", "-A", check=False)
+            for line in (result.stdout or "").splitlines():
+                if package_name in line:
+                    parts = line.split()
+                    if parts:
+                        try:
+                            return int(parts[1] if parts[0].startswith("u") else parts[0])
+                        except ValueError:
+                            continue
+            return None
+        try:
+            return int(out.split()[0])
+        except ValueError:
+            return None
+
+    def launch_app(self, package_name: str, wait_seconds: float = 4.0) -> int | None:
+        """Démarre l'app via adb (sans frida spawn). Retourne le PID si trouvé."""
+        log.info("Lancement de %s sur l'émulateur", package_name)
+        # Intent LAUNCHER (plus fiable que monkey seul)
+        self._run(
+            "shell", "am", "start",
+            "-a", "android.intent.action.MAIN",
+            "-c", "android.intent.category.LAUNCHER",
+            "-p", package_name,
+            check=False,
+        )
+        time.sleep(wait_seconds)
+        pid = self.get_running_pid(package_name)
+        if pid:
+            log.info("DIVA démarrée pid=%s", pid)
+            return pid
+        # Secours : monkey
+        self._run(
+            "shell", "monkey", "-p", package_name,
+            "-c", "android.intent.category.LAUNCHER", "1",
+            check=False,
+        )
+        time.sleep(wait_seconds)
+        pid = self.get_running_pid(package_name)
+        if pid:
+            log.info("DIVA démarrée (monkey) pid=%s", pid)
+        return pid
+
     def stop_app(self, package_name: str) -> None:
         self._run("shell", "am", "force-stop", package_name, check=False)
 

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
 import sys
 import uuid
+
+log = logging.getLogger(__name__)
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -94,13 +97,24 @@ class SessionManager:
         """Launch analyzer/main.py as a subprocess for a session."""
         runtime = self.require_runtime(session_id)
         if runtime.process and runtime.process.poll() is None:
+            log.info("Analyse déjà en cours pour %s", session_id)
             return
+        # Arrêter un ancien processus zombie avant d'en relancer un
+        if runtime.process is not None:
+            try:
+                if runtime.process.poll() is None:
+                    runtime.process.terminate()
+                    runtime.process.wait(timeout=3)
+            except Exception:
+                pass
+            runtime.process = None
 
         analyzer_main = PROJECT_ROOT / "analyzer" / "main.py"
         log_path = UPLOAD_DIR / f"{session_id}.analyzer.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         backend_ws = os.environ.get("BACKEND_WS_URL", "ws://localhost:8000")
         frida_server = os.environ.get("FRIDA_SERVER_PATH")
+        adb_serial = adb_serial or os.environ.get("ADB_SERIAL")
         cmd = [
             sys.executable,
             str(analyzer_main),
@@ -109,6 +123,7 @@ class SessionManager:
             session_id,
             "--ws",
             backend_ws,
+            "--skip-install",   # ne pas réinstaller : ça tue l'app ouverte sur l'émulateur
         ]
         if adb_serial:
             cmd.extend(["--serial", adb_serial])
@@ -127,6 +142,12 @@ class SessionManager:
             text=True,
         )
         runtime.model.status = "analyzing"
+
+    def mark_failed(self, session_id: str) -> None:
+        """Mark a session as failed after analyzer disconnect."""
+        runtime = self.sessions.get(session_id)
+        if runtime is not None:
+            runtime.model.status = "failed"
 
     def stop_analyzer(self, session_id: str) -> SessionModel:
         """Stop a running analyzer subprocess and return the final session report."""

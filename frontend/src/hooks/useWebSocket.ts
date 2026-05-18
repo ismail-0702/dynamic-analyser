@@ -27,13 +27,17 @@ export function useWebSocket(sessionId: string | null, onEvent?: (event: Analysi
   useEffect(() => {
     if (!sessionId) return undefined
     let stopped = false
+    let socket: WebSocket | null = null
 
     const connect = () => {
-      const socket = new WebSocket(`${WS_BASE_URL}/ws/${encodeURIComponent(sessionId)}?role=dashboard`)
+      if (stopped) return
+      socket = new WebSocket(`${WS_BASE_URL}/ws/${encodeURIComponent(sessionId)}?role=dashboard`)
       socketRef.current = socket
-      socket.onopen = () => setConnected(true)
+      socket.onopen = () => { if (!stopped) setConnected(true) }
       socket.onclose = () => {
         setConnected(false)
+        socket = null
+        socketRef.current = null
         if (!stopped) {
           reconnectTimer.current = window.setTimeout(connect, 3000)
         }
@@ -47,6 +51,12 @@ export function useWebSocket(sessionId: string | null, onEvent?: (event: Analysi
           store.updateRisk(frame.payload.risk)
           frame.payload.events.slice(0, 500).reverse().forEach((event) => store.addEvent(event))
           store.setAnalyzing(frame.payload.status === 'analyzing')
+          return
+        }
+        if (frame.kind === 'status' && frame.payload && typeof frame.payload === 'object') {
+          const status = (frame.payload as { status?: string }).status
+          if (status === 'analyzing') store.setAnalyzing(true)
+          if (status === 'stopped' || status === 'failed') store.setAnalyzing(false)
           return
         }
         if (frame.kind === 'message' && isPartialMessage(frame.payload)) {
@@ -65,13 +75,18 @@ export function useWebSocket(sessionId: string | null, onEvent?: (event: Analysi
       }
     }
 
-    connect()
+    const startTimer = window.setTimeout(connect, 0)
     return () => {
       stopped = true
+      window.clearTimeout(startTimer)
       if (reconnectTimer.current !== null) {
         window.clearTimeout(reconnectTimer.current)
       }
-      socketRef.current?.close()
+      if (socket) {
+        socket.onclose = null
+        socket.close()
+      }
+      setConnected(false)
     }
   }, [sessionId])
 

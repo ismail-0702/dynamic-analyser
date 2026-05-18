@@ -67,7 +67,7 @@ DYNAMIC_RULES = [
     
     # --- RÈGLES DE COMPORTEMENT (FILE/PREFS) ---
     # 1. Détecte l'utilisation des SharedPreferences (ce qu'on a vu dans tes logs)
-    ("file",     lambda e: e.get("path") == "SharedPreferences", 15, "behavior", "medium", "Stockage dans SharedPreferences"),
+    ("file",     lambda e: "SharedPreferences" in str(e.get("path","")) or "SharedPreferences" in str(e.get("operation","")), 15, "behavior", "medium", "Stockage dans SharedPreferences"),
     
     # 2. Détecte si un mot de passe est écrit en clair (clé ou valeur)
     ("file",     lambda e: any(x in str(e).lower() for x in ["password", "pwd", "user"]), 40, "behavior", "critical", "Identifiants en clair détectés"),
@@ -136,7 +136,11 @@ class EventCollector:
         self._loop = loop
 
     def on_message(self, message, _data):
-        if message.get("type") != "send":
+        mtype = message.get("type")
+        if mtype == "error":
+            log.error("Erreur Frida: %s", message.get("stack") or message.get("description"))
+            return
+        if mtype != "send":
             return
         payload = message.get("payload")
         if not isinstance(payload, dict):
@@ -147,13 +151,39 @@ class EventCollector:
         if "type" in edata:
             del edata["type"]
 
-        event = AnalysisEvent(type=etype, data=edata)
+        ts = payload.get("timestamp")
+        event = AnalysisEvent(
+            type=etype,
+            data=edata,
+            timestamp=ts if isinstance(ts, str) else datetime.now(timezone.utc).isoformat(),
+        )
         if self._loop:
             self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+
+    async def _wait_for_backend(self, uri: str, timeout: float = 60.0) -> None:
+        """Attend que uvicorn soit démarré avant d'injecter Frida."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                async with websockets.connect(uri, open_timeout=3) as ws:
+                    await ws.close()
+                log.info("Backend WebSocket disponible: %s", self.ws_uri)
+                return
+            except (OSError, websockets.InvalidURI, websockets.WebSocketException):
+                log.warning(
+                    "Backend injoignable (%s) — lancez: uvicorn backend.main:app --port 8000",
+                    self.ws_uri,
+                )
+                await asyncio.sleep(3)
+        raise RuntimeError(
+            f"Backend WebSocket indisponible après {timeout}s. "
+            f"Démarrez: uvicorn backend.main:app --reload --port 8000"
+        )
 
     async def send_loop(self):
         # Utilisation du paramètre role=analyzer pour ws.py
         uri = f"{self.ws_uri}/ws/{self.session_id}?role=analyzer"
+        await self._wait_for_backend(uri)
         while True:
             try:
                 async with websockets.connect(uri) as ws:
@@ -187,15 +217,23 @@ class EventCollector:
                 log.warning("WS erreur: %s — retry 3s", e)
                 await asyncio.sleep(3)
 
+JAVA_PROBE_SCRIPT = """
+rpc.exports = {
+    isReady: function () { return typeof Java !== 'undefined'; }
+};
+"""
+
 class DynamicAnalyzer:
     def __init__(self, apk_path, session_id, ws_uri="ws://localhost:8000",
-                 adb_serial=None, frida_server_local=None, skip_install=False):
+                 adb_serial=None, frida_server_local=None, skip_install=False,
+                 attach_only=True):
         self.apk_path = apk_path
         self.session_id = session_id
         self.ws_uri = ws_uri
         self.adb = ADBManager(serial=adb_serial)
         self.frida_server_local = frida_server_local
         self.skip_install = skip_install
+        self.attach_only = attach_only
         self.package = None
         self._device = None
         self._session = None
@@ -204,29 +242,84 @@ class DynamicAnalyzer:
 
     def _setup(self):
         self.adb.wait_for_device()
+        if self.frida_server_local:
+            self.adb.push_frida_server(self.frida_server_local)
         self.adb.start_frida_server()
         self.package = self.adb.get_package_name(self.apk_path)
         if not self.skip_install:
             self.adb.install_apk(self.apk_path)
 
+    def _wait_for_java(self, timeout: float = 45.0) -> None:
+        import time
+        probe = self._session.create_script(JAVA_PROBE_SCRIPT)
+        probe.load()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if probe.exports_sync.is_ready():
+                    log.info("Runtime Java détecté")
+                    probe.unload()
+                    return
+            except Exception as exc:
+                log.debug("Probe Java: %s", exc)
+            time.sleep(0.5)
+        probe.unload()
+        raise RuntimeError(
+            "Java indisponible après attente. Vérifiez que frida-server correspond à "
+            f"frida {frida.__version__} (même version sur PC et émulateur)."
+        )
+
+    def _attach_to_app(self) -> None:
+        import time
+        running_pid = self.adb.get_running_pid(self.package)
+        if not running_pid:
+            log.info("DIVA non ouverte — lancement automatique via adb am start")
+            running_pid = self.adb.launch_app(self.package)
+            for _ in range(12):
+                if running_pid:
+                    break
+                time.sleep(1)
+                running_pid = self.adb.get_running_pid(self.package)
+
+        if not running_pid:
+            raise RuntimeError(
+                f"Impossible de lancer {self.package}. Vérifiez l'émulateur (adb devices) "
+                f"et le numéro de série (--serial emulator-5554)."
+            )
+
+        try:
+            self._session = self._device.attach(running_pid)
+        except frida.ProcessNotFoundError as exc:
+            raise RuntimeError(
+                f"Processus DIVA (pid {running_pid}) introuvable — relancez l'app sur l'émulateur."
+            ) from exc
+        log.info("Attaché pid=%s (%s)", running_pid, self.package)
+
+    def _check_frida_version(self) -> None:
+        major = int(frida.__version__.split(".")[0])
+        if major >= 17:
+            raise RuntimeError(
+                f"Frida {frida.__version__} installé : l'objet Java n'existe plus dans hooks.js.\n"
+                "Corrigez avec :\n"
+                "  pip install \"frida>=16.2.1,<17\" \"frida-tools>=12.3.0,<13\"\n"
+                "  .\\scripts\\setup_frida16.ps1 emulator-5554\n"
+                "(réinstalle frida-server 16.x sur l'émulateur)"
+            )
+
     def _inject(self):
-        import subprocess
-        self._device = frida.get_usb_device(timeout=15)
-        
-        # On force la détection du PID par ADB pour être sûr
-        out = subprocess.check_output(["adb", "-s", self.adb.serial or "", "shell", "pidof", self.package])
-        target_pid = int(out.strip())
-        
-        self._session = self._device.attach(target_pid)
+        self._check_frida_version()
         script_src = HOOKS_PATH.read_text(encoding="utf-8")
+        self._device = frida.get_usb_device(timeout=15)
+        log.info("Frida %s | device=%s", frida.__version__, self._device.name)
+
+        self._attach_to_app()
+        self._wait_for_java()
+
         self._script = self._session.create_script(script_src)
         self._script.on("message", self.collector.on_message)
+        self._script.on("destroyed", lambda: log.warning("Script Frida détruit"))
         self._script.load()
-        import time
-        time.sleep(1)
-        # Envoyer le signal pour démarrer les hooks
-        
-        log.info("Hooks seront installés automatiquement après 2s")
+        log.info("Hooks installés sur le processus DIVA")
 
     def _cleanup(self):
         try:
@@ -238,31 +331,18 @@ class DynamicAnalyzer:
         loop = asyncio.get_event_loop()
         self.collector.set_loop(loop)
         await loop.run_in_executor(None, self._setup)
-        await loop.run_in_executor(None, self._inject)
-        log.info("=== Analyse en cours ===")
-        await self.collector.send_loop()
+        # Backend doit être prêt AVANT l'injection (sinon WinError 1225)
+        await self.collector._wait_for_backend(
+            f"{self.ws_uri}/ws/{self.session_id}?role=analyzer"
+        )
+        send_task = asyncio.create_task(self.collector.send_loop())
+        try:
+            await loop.run_in_executor(None, self._inject)
+            log.info("=== Analyse en cours ===")
+            await send_task
+        finally:
+            self._cleanup()
 
-    async def _on_message(self, message, data):
-        """Cette méthode est appelée par Frida à chaque hook"""
-        if message['type'] == 'send':
-            payload = message['payload']
-            
-            # 1. On donne l'info au RiskScorer (Classe n°5) pour mettre à jour les points
-            self.scorer.process_event(payload)
-            
-            # 2. On récupère le rapport global calculé
-            report = self.scorer.get_report()
-            
-            # 3. ON INSÈRE TON CODE ICI :
-            # On envoie les données formatées au AnalyzerWebSocketClient (Classe n°9)
-            await self.ws_client.send({
-                "session_id": self.session_id,
-                "type": "update",
-                "stats": report["dimensions"],    # Met à jour les compteurs (Fichiers, Réseau, etc.)
-                "alerts": report["alerts"],       # Envoie la liste des alertes
-                "global_score": report["global_score"] # Met à jour la jauge de risque
-            })
-# Pour le lancement direct via main.py
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -270,8 +350,16 @@ if __name__ == "__main__":
     parser.add_argument("--session", required=True)
     parser.add_argument("--ws", default="ws://localhost:8000")
     parser.add_argument("--serial")
-    parser.add_argument("--skip-install", action="store_true")
+    parser.add_argument("--skip-install", action="store_true", help="Ne pas réinstaller l'APK (recommandé)")
+    parser.add_argument("--allow-spawn", action="store_true",
+                        help="Autoriser frida spawn — FERME l'app (déconseillé)")
     args = parser.parse_args()
-    
-    analyzer = DynamicAnalyzer(args.apk, args.session, args.ws, adb_serial=args.serial, skip_install=args.skip_install)
+    attach_only = not args.allow_spawn  # défaut = attachement sans spawn
+
+    analyzer = DynamicAnalyzer(
+        args.apk, args.session, args.ws,
+        adb_serial=args.serial,
+        skip_install=args.skip_install,
+        attach_only=attach_only,
+    )
     asyncio.run(analyzer.run())
